@@ -23,6 +23,7 @@ from wumpus_engine.core.errors import (
     AgentReportedError,
     AgentTimeoutError,
     EngineStateError,
+    InvalidWorldError,
     ProtocolViolationError,
 )
 from wumpus_engine.core.results import (
@@ -120,7 +121,8 @@ class GameEngine:
         world is generated from (scenario, run_info.world_seed). No I/O on `gateway` or `renderer`.
         Post: status READY; agent on (1, 1) facing EAST with one arrow per Wumpus; empty ScoreManager;
         ActionLog header written.
-        Raises: WorldGenerationError: no valid world. InvalidWorldError: an explicit layout violates I1-I5.
+        Raises: WorldGenerationError: no valid world. InvalidWorldError: an explicit layout violates I1-I5,
+        or its Wumpus count differs from scenario.wumpus_count (the agent gets exactly one arrow per Wumpus).
         '''
         generator_version = 'injected'
         if world is None:
@@ -133,7 +135,11 @@ class GameEngine:
         self._gateway = gateway
         self._renderer = renderer
         self._world = world
-        self._initial_arrows = world.wumpuses_alive
+        if world.wumpuses_alive != scenario.wumpus_count:
+            raise InvalidWorldError(
+                f'the world has {world.wumpuses_alive} Wumpuses but the scenario sets {scenario.wumpus_count}'
+            )
+        self._initial_arrows = world.wumpuses_alive  # always one arrow per Wumpus, never more or fewer
         self._agent = AgentState(arrows=self._initial_arrows)
         self._score = ScoreManager(score_table)
         self._max_actions = (
@@ -274,6 +280,8 @@ class GameEngine:
                         scream = True
                         events.append(StepEvent.WUMPUS_KILLED)
                     else:
+                        # A missed arrow flies to the boundary and hits the wall: the agent hears a bump.
+                        bump = True
                         events.append(StepEvent.ARROW_MISSED)
             case Action.GRAB:
                 if world.take_gold(agent.position):

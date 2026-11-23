@@ -356,6 +356,9 @@ def _observer_header_from_json(data: dict[str, object]) -> LogHeader:
         world_layout = None if layout is None else WorldSpec.from_json(_as_obj(layout, 'header.world_layout'))
         if world_layout is not None:
             world_layout.validate(SolvabilityPolicy.NONE)  # a replayable layout must satisfy I1 to I4
+            arrows = _as_int(data['initial_arrows'], 'header.initial_arrows')
+            if arrows != len(world_layout.wumpuses):
+                raise ValueError(f'initial_arrows {arrows} must equal the {len(world_layout.wumpuses)} Wumpuses')
     except (ValueError, InvalidWorldError) as exc:
         raise LogFormatError(f'bad header: {exc}') from exc
     return LogHeader(

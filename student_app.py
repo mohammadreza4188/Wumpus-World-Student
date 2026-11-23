@@ -40,6 +40,7 @@ import time
 import tkinter as tk
 import traceback
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -407,9 +408,45 @@ def _random_seed() -> int:
     return random.SystemRandom().randrange(1_000_000)  # short enough to read and quote
 
 
+_ODD_SPACES: Final[re.Pattern[str]] = re.compile('[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]')
+# Only characters that carry no meaning in any script: zero-width space, word joiner, byte-order mark.
+# U+200C (ZWNJ, the Persian half-space) and U+200D (ZWJ) are NOT listed: Persian needs them.
+_INVISIBLE: Final[re.Pattern[str]] = re.compile('[\u200b\u2060\ufeff]')
+_LEADING_WS: Final[re.Pattern[str]] = re.compile(r'^[ \t]+', re.MULTILINE)
+
+
+def normalize_pasted(text: str) -> str:
+    '''Post: `text` as the code box should hold it, never shorter than its visible content. Text copied from
+    a web page, a PDF or Word often carries what Python rejects while looking fine on screen: Windows or
+    old-Mac line ends, hard tabs mixed with spaces ("inconsistent use of tabs and spaces"), non-breaking
+    spaces and zero-width spaces. Line ends become \\n, those spaces become plain spaces, the zero-width
+    space, word joiner and byte-order mark go, and the tabs in the indentation of a line become four
+    spaces each. Everything else, Persian and other right-to-left text and the joiners it needs included,
+    is left exactly as it is.
+    '''
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = _INVISIBLE.sub('', _ODD_SPACES.sub(' ', text))
+    return _LEADING_WS.sub(lambda match: match.group().expandtabs(4), text)
+
+
+def _pick_mono_font(root: tk.Misc) -> tkfont.Font:
+    '''Post: a font whose letters all have the same width, so that code lines up: the first of a few
+    well-known monospace families that is installed and really is fixed-width, else Tk's TkFixedFont.
+    '''
+    installed = set(tkfont.families(root))
+    for family in ('Consolas', 'Cascadia Mono', 'Menlo', 'DejaVu Sans Mono', 'Liberation Mono', 'Courier New', 'Courier'):
+        if family in installed:
+            font = tkfont.Font(root=root, family=family, size=10)
+            if font.metrics('fixed'):
+                return font
+    font = tkfont.nametofont('TkFixedFont', root=root).copy()
+    font.configure(size=10)
+    return font
+
+
 def _make_code_box(parent: tk.Misc, font: tkfont.Font, *, width: int, height: int) -> tuple[ttk.Frame, tk.Text]:
     '''Post: a frame holding a monospace Text for Python code with both scrollbars. Tab inserts four spaces,
-    Ctrl+A selects everything, and the 'error' tag (a red line) goes away at the next key.
+    Ctrl+X / C / V / A and a right-click menu work on any keyboard layout, and the 'error' tag (a red line) goes away at the next key.
     '''
     box = ttk.Frame(parent)
     box.columnconfigure(0, weight=1)
@@ -423,18 +460,164 @@ def _make_code_box(parent: tk.Misc, font: tkfont.Font, *, width: int, height: in
     horizontal.grid(row=1, column=0, sticky='ew')
     code.tag_configure('error', background='#ffd0d0', foreground='#000000')
 
+    def clear_error(_event: object = None) -> None:
+        code.tag_remove('error', '1.0', 'end')
+
+    def begin_step() -> None:
+        '''Post: everything up to end_step() is ONE undo step (Tk would otherwise split a delete and an insert).'''
+        code.edit_separator()
+        code.configure(autoseparators=False)
+
+    def end_step() -> None:
+        code.edit_separator()
+        code.configure(autoseparators=True)
+
+    def block_lines() -> tuple[int, int] | None:
+        '''Post: the first and last line a selection spans (a selection that ends at the start of a line
+        does not include that line), or None when the selection is empty or inside one line.
+        '''
+        if not code.tag_ranges('sel'):
+            return None
+        first = int(code.index('sel.first').split('.')[0])
+        last_line, last_col = (int(part) for part in code.index('sel.last').split('.'))
+        last = last_line - 1 if last_col == 0 and last_line > first else last_line
+        return (first, last) if last > first else None
+
     def indent(_event: tk.Event[tk.Text]) -> str:
-        code.insert('insert', '    ')
+        '''Tab: four spaces at the cursor (replacing a selection inside one line), or at the start of every
+        selected line. Returning 'break' keeps the keystroke from moving the focus to the next widget.
+        '''
+        clear_error()
+        begin_step()
+        lines = block_lines()
+        if lines is not None:
+            for number in range(lines[0], lines[1] + 1):
+                code.insert(f'{number}.0', '    ')
+        else:
+            if code.tag_ranges('sel'):
+                code.delete('sel.first', 'sel.last')
+            code.insert('insert', '    ')
+        end_step()
         return 'break'
 
-    def select_all(_event: tk.Event[tk.Text]) -> str:
+    def unindent(_event: tk.Event[tk.Text]) -> str:
+        '''Shift+Tab: up to four leading spaces (or one tab) off the current line or every selected line.'''
+        clear_error()
+        lines = block_lines()
+        if lines is None:
+            line = int(code.index('insert').split('.')[0])
+            lines = (line, line)
+        begin_step()
+        for number in range(lines[0], lines[1] + 1):
+            text = code.get(f'{number}.0', f'{number}.0 lineend')
+            if text.startswith('\t'):
+                remove = 1
+            else:
+                remove = min(len(text) - len(text.lstrip(' ')), 4)
+            if remove:
+                code.delete(f'{number}.0', f'{number}.{remove}')
+        end_step()
+        return 'break'
+
+    def paste(_event: object = None) -> str:
+        '''Ctrl+V, Shift+Insert, Command+V, the right-click menu: the clipboard text, with its indentation made
+        safe (see normalize_pasted), replaces the selection as one undo step. An empty clipboard, or one
+        that holds no text, does nothing. Persian and other Unicode text is inserted as it is.
+        '''
+        try:
+            text = normalize_pasted(code.clipboard_get())
+        except (tk.TclError, UnicodeError):  # nothing to paste
+            return 'break'
+        if not text:
+            return 'break'
+        clear_error()
+        begin_step()
+        try:
+            if code.tag_ranges('sel'):
+                code.delete('sel.first', 'sel.last')
+            code.insert('insert', text)
+        finally:
+            end_step()
+        code.see('insert')
+        return 'break'
+
+    def copy(_event: object = None) -> str:
+        '''Ctrl+C, Ctrl+Insert, the right-click menu: the selected text goes on the clipboard.'''
+        if code.tag_ranges('sel'):
+            code.clipboard_clear()
+            code.clipboard_append(code.get('sel.first', 'sel.last'))
+        return 'break'
+
+    def cut(_event: object = None) -> str:
+        '''Ctrl+X, the right-click menu: copy, then delete the selection (one undo step).'''
+        if code.tag_ranges('sel'):
+            copy()
+            clear_error()
+            begin_step()
+            try:
+                code.delete('sel.first', 'sel.last')
+            finally:
+                end_step()
+        return 'break'
+
+    def select_all(_event: object = None) -> str:
         code.tag_add('sel', '1.0', 'end-1c')
+        code.mark_set('insert', 'end-1c')
+        return 'break'
+
+    # Windows: Tk matches <Control-v> by KEYSYM, and with a Persian (or any non-Latin) keyboard layout
+    # Ctrl+V produces the keysym of a Persian letter, so no shortcut would fire. The key's virtual-key
+    # code does not depend on the layout: 86 V, 67 C, 88 X, 65 A.
+    layout_free: dict[int, Callable[[object], str]] = {86: paste, 67: copy, 88: cut, 65: select_all}
+
+    def control_key(event: tk.Event[tk.Text]) -> str | None:
+        if sys.platform == 'win32' and event.keycode in layout_free and not event.state & 0x20000:  # no Alt
+            return layout_free[event.keycode](event)
+        return None  # any other Ctrl combination keeps its default meaning
+
+    menu = tk.Menu(code, tearoff=False)
+    menu.add_command(label='Cut', accelerator='Ctrl+X', command=cut)
+    menu.add_command(label='Copy', accelerator='Ctrl+C', command=copy)
+    menu.add_command(label='Paste', accelerator='Ctrl+V', command=paste)
+    menu.add_separator()
+    menu.add_command(label='Select All', accelerator='Ctrl+A', command=select_all)
+
+    def show_menu(event: tk.Event[tk.Text]) -> str:
+        '''Right click: the Cut / Copy / Paste / Select All menu, with the entries that cannot work greyed out.'''
+        code.focus_set()
+        selected = bool(code.tag_ranges('sel'))
+        if not selected:
+            code.mark_set('insert', f'@{event.x},{event.y}')
+        try:
+            code.clipboard_get()
+            pasteable = True
+        except (tk.TclError, UnicodeError):
+            pasteable = False
+        menu.entryconfigure('Cut', state='normal' if selected else 'disabled')
+        menu.entryconfigure('Copy', state='normal' if selected else 'disabled')
+        menu.entryconfigure('Paste', state='normal' if pasteable else 'disabled')
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
         return 'break'
 
     code.bind('<Tab>', indent)
+    code.bind('<Shift-Tab>', unindent)
+    code.bind('<ISO_Left_Tab>', unindent)  # the keysym of Shift+Tab on X11
+    for sequence in ('<Control-v>', '<Control-V>', '<Shift-Insert>', '<<Paste>>'):
+        code.bind(sequence, paste)
+    code.bind('<Control-Insert>', copy)  # Ctrl+Insert is COPY on Windows (Shift+Insert pastes)
+    for sequence in ('<Control-c>', '<Control-C>', '<<Copy>>'):
+        code.bind(sequence, copy)
+    for sequence in ('<Control-x>', '<Control-X>', '<<Cut>>'):
+        code.bind(sequence, cut)
     code.bind('<Control-a>', select_all)
     code.bind('<Control-A>', select_all)
-    code.bind('<Key>', lambda _event: code.tag_remove('error', '1.0', 'end'), add='+')
+    code.bind('<Control-Key>', control_key)  # fallback for a non-Latin keyboard layout, see layout_free
+    for sequence in ('<Button-3>', '<Button-2>', '<Control-Button-1>') if sys.platform == 'darwin' else ('<Button-3>',):
+        code.bind(sequence, show_menu)
+    code.bind('<Key>', clear_error, add='+')
     return box, code
 
 
@@ -512,8 +695,7 @@ class StudentApp:
         root.title('Wumpus World - Student Edition')
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
-        self._mono = tkfont.nametofont('TkFixedFont').copy()  # kept: a Tk font disappears with its object
-        self._mono.configure(size=10)
+        self._mono = _pick_mono_font(root)  # kept: a Tk font disappears with its object
         self._popup = ProblemPopup(root, self._mono)
         self._directory = Path(tempfile.mkdtemp(prefix='wumpus_student_'))  # the child's source_dir
         self._serial = 0
@@ -661,7 +843,7 @@ class StudentApp:
         try:
             world = World(WorldGenerator().generate(scenario, self._seed))
             frame = RenderFrame(
-                mode=RenderMode.OBSERVER, turn=0, agent=AgentState(arrows=wumpuses).snapshot(), last_action=None,
+                mode=RenderMode.OBSERVER, turn=0, agent=AgentState(arrows=world.wumpuses_alive).snapshot(), last_action=None,
                 last_percept=world.perceive(START_POSITION), score_total=0, score_delta=0, terminal=False,
                 outcome=None, termination=None, world=world.snapshot(),
                 note='New game: press Step or Run All.')

@@ -16,7 +16,7 @@ The **Wumpus World** is a classic AI problem. Your agent starts at the bottom-le
 
 Your agent never sees the map. Each turn it receives an *observation* with five percepts:
 
-`breeze` · `stench` · `glitter` · `bump` (walked into a wall) · `scream` (a Wumpus was killed by your arrow)
+`breeze` · `stench` · `glitter` · `bump` (walked into a wall, **or** your arrow missed and hit the wall) · `scream` (a Wumpus was killed by your arrow)
 
 …plus its own `position`, `direction`, `arrows_remaining` and `has_gold`.
 
@@ -28,7 +28,7 @@ Your agent never sees the map. Each turn it receives an *observation* with five 
 |---|---|
 | `Action.MOVE_FORWARD` | Move one cell in the facing direction |
 | `Action.TURN_LEFT` / `Action.TURN_RIGHT` | Rotate 90° |
-| `Action.SHOOT` | Fire an arrow straight ahead (one arrow per Wumpus) |
+| `Action.SHOOT` | Fire an arrow straight ahead. You get exactly one arrow per Wumpus on the map, set automatically from Number of Wumpuses |
 | `Action.GRAB` | Pick up the gold (only works on the gold's cell) |
 | `Action.CLIMB` | Leave the cave (only works at (1, 1)) |
 
@@ -190,5 +190,6 @@ Do **not** submit the whole repository, screenshots, or modified framework files
 - Track a set of *visited* cells and a set of *provably safe* cells.
 - A breeze or stench on the very first cell is a special case. Think about what you can and cannot conclude.
 - Killing a Wumpus (`SHOOT` + `scream`) removes its stench from the map.
+- After a `SHOOT`, `scream` means a hit and `bump` means the arrow missed and flew into the wall. Check your last action to tell this `bump` from walking into a wall.
 
 Good luck, and may your logic be sound! 🧠
